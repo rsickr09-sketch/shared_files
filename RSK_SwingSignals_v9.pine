@@ -1,0 +1,232 @@
+//@version=5
+indicator("RSK Swing Signals v8", overlay=true, max_labels_count=500)
+
+// ── INPUTS ───────────────────────────────────────────────────
+var g_ema   = "EMA Settings"
+ema_fast    = input.int(8,    "Fast EMA",          group=g_ema)
+ema_mid     = input.int(20,   "Mid EMA",           group=g_ema)
+ema_slow    = input.int(50,   "Slow EMA",          group=g_ema)
+show_emas   = input.bool(true,"Show EMAs",         group=g_ema)
+
+var g_macd  = "MACD Settings"
+macd_fast   = input.int(12,   "MACD Fast",         group=g_macd)
+macd_slow   = input.int(26,   "MACD Slow",         group=g_macd)
+macd_sig    = input.int(9,    "MACD Signal",       group=g_macd)
+macd_lb     = input.int(8,    "MACD Lookback",     group=g_macd)
+
+var g_rsi   = "RSI Settings"
+rsi_len     = input.int(14,   "RSI Length",        group=g_rsi)
+rsi_ob      = input.int(65,   "RSI Overbought",    group=g_rsi)
+rsi_os      = input.int(35,   "RSI Oversold",      group=g_rsi)
+
+var g_vol   = "Volume Settings"
+vol_len     = input.int(20,   "Vol Avg Length",    group=g_vol)
+vol_mult    = input.float(1.5,"Vol Spike Mult",    group=g_vol, step=0.1)
+
+var g_bb    = "Bollinger Band Settings"
+bb_len      = input.int(20,   "BB Length",         group=g_bb)
+bb_dev      = input.float(2.0,"BB Std Dev",        group=g_bb, step=0.1)
+bb_touch    = input.float(0.002,"BB Touch Pct",    group=g_bb, step=0.001)
+
+var g_kc    = "Keltner Channel Settings"
+kc_len      = input.int(20,   "KC Length",         group=g_kc)
+kc_mult     = input.float(1.5,"KC Multiplier",     group=g_kc, step=0.1)
+
+var g_sig   = "Signal Settings"
+min_buy     = input.int(3,    "Min Buy Score",     group=g_sig, minval=1, maxval=5)
+min_sell    = input.int(3,    "Min Sell Score",    group=g_sig, minval=1, maxval=5)
+cooldown    = input.int(3,    "Cooldown Bars",     group=g_sig, minval=1)
+show_labels = input.bool(true,"Show Labels",       group=g_sig)
+show_sqz    = input.bool(true,"Show Squeeze Dots", group=g_sig)
+
+// ── EMAs ─────────────────────────────────────────────────────
+e8  = ta.ema(close, ema_fast)
+e20 = ta.ema(close, ema_mid)
+e50 = ta.ema(close, ema_slow)
+
+plot(show_emas ? e8  : na, "EMA 8",  color=color.new(color.aqua,   0), linewidth=1)
+plot(show_emas ? e20 : na, "EMA 20", color=color.new(color.yellow, 0), linewidth=1)
+plot(show_emas ? e50 : na, "EMA 50", color=color.new(color.orange, 0), linewidth=2)
+
+// ── MACD ─────────────────────────────────────────────────────
+macd_line   = ta.ema(close, macd_fast) - ta.ema(close, macd_slow)
+macd_sig_ln = ta.ema(macd_line, macd_sig)
+macd_hist   = macd_line - macd_sig_ln
+
+macd_positive = macd_hist > 0
+macd_negative = macd_hist < 0
+macd_rising   = macd_hist > macd_hist[1]
+macd_falling  = macd_hist < macd_hist[1]
+
+// Recent cross lookback using ta.barssince — no loop needed
+bars_since_cross_up   = ta.barssince(macd_hist > 0 and macd_hist[1] <= 0)
+bars_since_cross_down = ta.barssince(macd_hist < 0 and macd_hist[1] >= 0)
+
+macd_rec_up   = not na(bars_since_cross_up)   and bars_since_cross_up   <= macd_lb
+macd_rec_down = not na(bars_since_cross_down) and bars_since_cross_down <= macd_lb
+
+macd_bull = macd_positive and macd_rising  and (macd_rec_up   or macd_hist > macd_hist[3])
+macd_bear = macd_negative and macd_falling and (macd_rec_down or macd_hist < macd_hist[3])
+
+// ── RSI ──────────────────────────────────────────────────────
+rsi_val     = ta.rsi(close, rsi_len)
+rsi_ok_buy  = rsi_val < rsi_ob
+rsi_ok_sell = rsi_val > rsi_os
+
+// ── VOLUME ───────────────────────────────────────────────────
+avg_vol   = ta.sma(volume, vol_len)
+vol_spike = volume >= vol_mult * avg_vol
+
+// ── BOLLINGER BANDS ──────────────────────────────────────────
+[bb_mid, bb_upper, bb_lower] = ta.bb(close, bb_len, bb_dev)
+bb_width     = bb_upper - bb_lower
+bb_expanding = bb_width > bb_width[1]
+
+bb_lower_touch  = low  <= bb_lower * (1 + bb_touch) and close > bb_lower
+bb_upper_touch  = high >= bb_upper * (1 - bb_touch) and close < bb_upper
+bb_lower_bounce = bb_lower_touch or bb_lower_touch[1]
+bb_upper_bounce = bb_upper_touch or bb_upper_touch[1]
+
+bb_bull_exp = close > bb_mid and bb_expanding
+bb_bear_exp = close < bb_mid and bb_expanding
+
+// ── KELTNER CHANNEL + TTM SQUEEZE ────────────────────────────
+kc_basis = ta.ema(close, kc_len)
+kc_range = ta.ema(ta.tr, kc_len)
+kc_upper = kc_basis + kc_mult * kc_range
+kc_lower = kc_basis - kc_mult * kc_range
+
+ttm_squeeze_on  = bb_upper < kc_upper and bb_lower > kc_lower
+ttm_squeeze_off = not ttm_squeeze_on
+
+squeeze_fired_up   = ttm_squeeze_off and ttm_squeeze_on[1] and close > bb_mid
+squeeze_fired_down = ttm_squeeze_off and ttm_squeeze_on[1] and close < bb_mid
+
+squeeze_bull = squeeze_fired_up   or squeeze_fired_up[1]   or squeeze_fired_up[2]
+squeeze_bear = squeeze_fired_down or squeeze_fired_down[1] or squeeze_fired_down[2]
+
+bb_bull = bb_lower_bounce or bb_bull_exp or squeeze_bull
+bb_bear = bb_upper_bounce or bb_bear_exp or squeeze_bear
+
+// ── EMA TREND CONTEXT ────────────────────────────────────────
+ema_bull_stack  = e8 > e20 and e20 > e50
+ema_bear_stack  = e8 < e20
+price_above_all = close > e8 and close > e20 and close > e50
+price_below_key = close < e8 or close < e20
+
+price_bull   = price_above_all and ema_bull_stack
+price_bear   = price_below_key and ema_bear_stack
+sell_blocked = ema_bull_stack and close > e50
+
+// ── SCORING ──────────────────────────────────────────────────
+buy_score  = (rsi_ok_buy     ? 1 : 0) +
+             (vol_spike      ? 1 : 0) +
+             (bb_bull        ? 1 : 0) +
+             (price_bull     ? 1 : 0) +
+             (ema_bull_stack ? 1 : 0)
+
+sell_score = (rsi_ok_sell    ? 1 : 0) +
+             (vol_spike      ? 1 : 0) +
+             (bb_bear        ? 1 : 0) +
+             (price_bear     ? 1 : 0) +
+             (ema_bear_stack ? 1 : 0)
+
+// ── RAW SIGNALS ──────────────────────────────────────────────
+raw_buy  = macd_bull and buy_score  >= min_buy  and not macd_bear
+raw_sell = macd_bear and sell_score >= min_sell and not macd_bull and not sell_blocked
+
+// ── COOLDOWN ─────────────────────────────────────────────────
+var int bars_since_buy  = cooldown + 1
+var int bars_since_sell = cooldown + 1
+
+bars_since_buy  := raw_buy[1]  ? 0 : math.min(bars_since_buy  + 1, cooldown + 1)
+bars_since_sell := raw_sell[1] ? 0 : math.min(bars_since_sell + 1, cooldown + 1)
+
+final_buy  = raw_buy  and bars_since_buy  >= cooldown and not raw_sell
+final_sell = raw_sell and bars_since_sell >= cooldown and not raw_buy
+
+// ── SQUEEZE DOTS ─────────────────────────────────────────────
+sqz_color = ttm_squeeze_on ? color.new(color.fuchsia, 0) : color.new(color.gray, 60)
+plot(show_sqz ? bb_mid : na, "Squeeze", color=sqz_color, style=plot.style_circles, linewidth=3)
+
+// ── ARROWS ───────────────────────────────────────────────────
+plotshape(final_buy,  title="Buy Signal",  style=shape.arrowup,
+     location=location.belowbar, color=color.new(color.green, 0), size=size.normal)
+plotshape(final_sell, title="Sell Signal", style=shape.arrowdown,
+     location=location.abovebar, color=color.new(color.red,   0), size=size.normal)
+
+// ── LABELS ───────────────────────────────────────────────────
+if show_labels and final_buy
+    lbl = squeeze_bull    ? "BUY SQZ " + str.tostring(buy_score) + "/5" :
+          bb_lower_bounce ? "BUY BB "  + str.tostring(buy_score) + "/5" :
+          buy_score == 5  ? "BUY 5/5" :
+          buy_score == 4  ? "BUY 4/5" : "BUY 3/5"
+    label.new(bar_index, low * 0.987, text=lbl,
+         color=color.new(color.green, 10), textcolor=color.white,
+         style=label.style_label_up, size=size.small)
+
+if show_labels and final_sell
+    lbl = squeeze_bear    ? "SELL SQZ " + str.tostring(sell_score) + "/5" :
+          bb_upper_bounce ? "SELL BB "  + str.tostring(sell_score) + "/5" :
+          sell_score == 5 ? "SELL 5/5" :
+          sell_score == 4 ? "SELL 4/5" : "SELL 3/5"
+    label.new(bar_index, high * 1.013, text=lbl,
+         color=color.new(color.red, 10), textcolor=color.white,
+         style=label.style_label_down, size=size.small)
+
+// ── STATUS TABLE ─────────────────────────────────────────────
+var table info = table.new(position.top_right, 2, 7,
+     bgcolor=color.new(color.black, 70), border_width=1,
+     border_color=color.new(color.gray, 60))
+
+if barstate.islast
+    lbl_col  = color.new(color.gray,    0)
+    val_col  = color.new(color.white,   0)
+    bull_col = color.new(color.green,   0)
+    bear_col = color.new(color.red,     0)
+    sqz_col  = color.new(color.fuchsia, 0)
+
+    table.cell(info, 0, 0, "RSK v8",     text_color=val_col, bgcolor=color.new(color.navy, 40), text_size=size.small)
+    table.cell(info, 1, 0, "Status",     text_color=val_col, bgcolor=color.new(color.navy, 40), text_size=size.small)
+    table.cell(info, 0, 1, "RSI",        text_color=lbl_col, text_size=size.small)
+    table.cell(info, 1, 1, str.tostring(math.round(rsi_val)),
+         text_color=rsi_val > rsi_ob ? bear_col : rsi_val < rsi_os ? bull_col : val_col,
+         text_size=size.small)
+    table.cell(info, 0, 2, "MACD",       text_color=lbl_col, text_size=size.small)
+    table.cell(info, 1, 2, (macd_positive ? "+" : "-") + (macd_rising ? "▲" : "▼"),
+         text_color=macd_bull ? bull_col : macd_bear ? bear_col : val_col,
+         text_size=size.small)
+    table.cell(info, 0, 3, "Squeeze",    text_color=lbl_col, text_size=size.small)
+    table.cell(info, 1, 3, ttm_squeeze_on ? "● ON" : "○ OFF",
+         text_color=ttm_squeeze_on ? sqz_col : val_col,
+         text_size=size.small)
+    table.cell(info, 0, 4, "Volume",     text_color=lbl_col, text_size=size.small)
+    table.cell(info, 1, 4, vol_spike ? "SPIKE ▲" : "normal",
+         text_color=vol_spike ? bull_col : val_col,
+         text_size=size.small)
+    table.cell(info, 0, 5, "Buy Score",  text_color=lbl_col, text_size=size.small)
+    table.cell(info, 1, 5, str.tostring(buy_score) + "/5",
+         text_color=buy_score >= min_buy ? bull_col : val_col,
+         text_size=size.small)
+    table.cell(info, 0, 6, "Sell Score", text_color=lbl_col, text_size=size.small)
+    table.cell(info, 1, 6, str.tostring(sell_score) + "/5",
+         text_color=sell_score >= min_sell ? bear_col : val_col,
+         text_size=size.small)
+
+// ── BACKGROUND HIGHLIGHT ─────────────────────────────────────
+bgcolor(ttm_squeeze_on ? color.new(color.fuchsia, 95) : na,
+     title="Squeeze Active Background")
+
+// ── ALERTS ───────────────────────────────────────────────────
+alertcondition(final_buy  and squeeze_bull,
+     "RSK BUY — Squeeze Breakout",  "RSK: BUY SQUEEZE BREAKOUT {{ticker}} @ {{close}}")
+alertcondition(final_buy  and bb_lower_bounce,
+     "RSK BUY — BB Lower Bounce",   "RSK: BUY BB LOWER BOUNCE {{ticker}} @ {{close}}")
+alertcondition(final_buy  and not squeeze_bull and not bb_lower_bounce,
+     "RSK BUY — Standard",          "RSK: BUY SIGNAL {{ticker}} @ {{close}}")
+alertcondition(final_sell and squeeze_bear,
+     "RSK SELL — Squeeze Breakout", "RSK: SELL SQUEEZE BREAKOUT {{ticker}} @ {{close}}")
+alertcondition(final_sell and bb_upper_bounce,
+     "RSK SELL — BB Upper Bounce",  "RSK: SELL BB UPPER BOUNCE {{ticker}} @ {{close}}")
+alertcondition(final_sell and not squeeze_bear and not bb_upper_bounce,
+     "RSK SELL — Standard",         "RSK: SELL SIGNAL {{ticker}} @ {{close}}")

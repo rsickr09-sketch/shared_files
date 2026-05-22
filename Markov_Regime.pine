@@ -1,0 +1,272 @@
+//@version=5
+// =============================================================================
+// Markov Regime — Bull / Bear / Sideways
+// =============================================================================
+// Live, on-chart visualisation of the Markov regime framework.
+// Labels every bar Bull/Bear/Sideways using a rolling log-return rule, then
+// builds the 3x3 transition matrix and stationary distribution from visible
+// chart history and prints both as corner tables.
+//
+// Author: Lewis Jackson · Framework: Roan (@RohOnChain)
+// Companion video: youtube.com/@lewisjackson
+// REPO: github.com/jackson-video-resources/markov-hedge-fund-method
+//
+// USAGE — load on BTCUSDT daily. Adjust thresholds to taste. Defaults are 20-bar
+// lookback, +/-5% thresholds. The diagonal of the transition matrix (persistence)
+// is the load-bearing reveal — visually elevated by brighter cell tint + white
+// text vs off-diagonal at 70% white.
+//
+// TEST CASES (manual — needs TradingView to validate):
+//   - BTCUSDT daily, full history: ribbon flips Bull/Bear/Sideways at obvious
+//     regime turns (2017-Q4 parabolic, 2018 bear, 2020-03 COVID, 2024+ bull).
+//   - Each row of the transition matrix sums to ~100% (allow +/-0.5% for float
+//     rounding from row-normalisation).
+//   - Stationary distribution converges by 50 iterations on real BTC data and
+//     sums to 1.0 (+/-0.001). Reduce stationary_power if performance lags.
+//
+// PALETTE (matches Roan storyboard — hsl(150,38%,64%) / hsl(354,48%,64%) /
+// hsl(220,14%,68%) — desaturated muted tints, never neon):
+//   Bull    : rgb(132,187,161) — soft green
+//   Bear    : rgb(197,127,134) — muted rose
+//   Sideways: rgb(164,171,183) — cool grey
+// =============================================================================
+
+indicator("Markov Regime - Bull / Bear / Sideways", overlay = true, max_labels_count = 500)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ────────────────────────────────────────────────────────────────────────────
+grp_logic    = "Regime logic"
+grp_display  = "Display"
+grp_position = "Table positions"
+
+lookback_window    = input.int(20,   title = "Lookback window (bars)",        minval = 5,   maxval = 250, group = grp_logic, tooltip = "Number of bars used for the rolling log-return calculation.")
+bull_threshold_pct = input.float(5.0, title = "Bull threshold (%)",            minval = 0.1, maxval = 50.0, step = 0.1, group = grp_logic, tooltip = "Rolling log-return above this (in %) labels the bar Bull.")
+bear_threshold_pct = input.float(5.0, title = "Bear threshold (%)",            minval = 0.1, maxval = 50.0, step = 0.1, group = grp_logic, tooltip = "Rolling log-return below the negative of this (in %) labels the bar Bear. Set independently from Bull for asymmetric thresholds.")
+stationary_power   = input.int(50,   title = "Stationary power (iterations)", minval = 10,  maxval = 200, group = grp_logic, tooltip = "How many times to multiply the matrix when computing the stationary distribution. 50 is essentially converged for any well-behaved 3x3 stochastic matrix.")
+
+show_regime_ribbon     = input.bool(true, title = "Show regime ribbon",            group = grp_display)
+show_regime_banner     = input.bool(true, title = "Show current-regime banner",    group = grp_display)
+show_matrix_table      = input.bool(true, title = "Show transition matrix",        group = grp_display)
+show_stationary_table  = input.bool(true, title = "Show stationary distribution",  group = grp_display)
+show_transition_labels = input.bool(true, title = "Label state transitions on chart", group = grp_display, tooltip = "Drops a label on every bar where the regime changes, e.g. BULL → BEAR.")
+table_text_size        = input.string("huge", title = "Table text size", options = ["small","normal","large","huge"], group = grp_display, tooltip = "Size of the transition-matrix and long-run-mix tables. 'huge' is about 3x the old default - good for screen grabs.")
+min_regime_hold        = input.int(4, title = "Min bars a regime must hold to be labelled", minval = 1, maxval = 50, group = grp_display, tooltip = "A new regime must persist this many confirmed bars before its transition gets a chart label. Kills the label spam in choppy zones - higher = fewer, cleaner markers.")
+
+banner_position_input     = input.string("top_left",     title = "Banner position",      options = ["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group = grp_position)
+matrix_position_input     = input.string("top_right",    title = "Matrix position",      options = ["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group = grp_position)
+stationary_position_input = input.string("bottom_right", title = "Stationary position",  options = ["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group = grp_position)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Position-string → position constant mapping
+// ────────────────────────────────────────────────────────────────────────────
+position_from_string(s) =>
+    switch s
+        "top_left"      => position.top_left
+        "top_center"    => position.top_center
+        "top_right"     => position.top_right
+        "middle_left"   => position.middle_left
+        "middle_center" => position.middle_center
+        "middle_right"  => position.middle_right
+        "bottom_left"   => position.bottom_left
+        "bottom_center" => position.bottom_center
+        "bottom_right"  => position.bottom_right
+        => position.top_right
+
+banner_pos     = position_from_string(banner_position_input)
+matrix_pos     = position_from_string(matrix_position_input)
+stationary_pos = position_from_string(stationary_position_input)
+
+size_from_string(s) =>
+    switch s
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        "huge"   => size.huge
+        => size.large
+notch_down(s) =>
+    switch s
+        "huge"   => "large"
+        "large"  => "normal"
+        "normal" => "small"
+        => "small"
+val_size = size_from_string(table_text_size)
+hdr_size = size_from_string(notch_down(table_text_size))
+
+// ────────────────────────────────────────────────────────────────────────────
+// Palette
+// ────────────────────────────────────────────────────────────────────────────
+c_bull_ribbon = color.rgb(132, 187, 161, 70)
+c_bear_ribbon = color.rgb(197, 127, 134, 70)
+c_side_ribbon = color.rgb(164, 171, 183, 70)
+
+c_bull_solid  = color.rgb(132, 187, 161, 30)
+c_bear_solid  = color.rgb(197, 127, 134, 30)
+c_side_solid  = color.rgb(164, 171, 183, 30)
+
+c_bull_dim    = color.rgb(132, 187, 161, 85)
+c_bear_dim    = color.rgb(197, 127, 134, 85)
+c_side_dim    = color.rgb(164, 171, 183, 85)
+
+c_bg          = color.new(color.black, 30)
+c_text_active = color.white
+c_text_dim    = color.new(color.white, 30)
+c_border      = color.new(color.white, 60)
+
+c_card_bg     = color.new(#0B0F0D, 8)
+c_card_frame  = color.new(#3FDE7E, 78)
+c_accent      = #3FDE7E
+c_diag_bg     = color.new(#3FDE7E, 80)
+c_diag_txt    = #6BF0A6
+c_off_txt     = color.new(color.white, 55)
+c_hdr_txt     = color.new(color.white, 35)
+c_foot_txt    = color.new(color.white, 60)
+
+regime_solid(r) => r == 1 ? c_bull_solid  : r == 2 ? c_bear_solid  : c_side_solid
+regime_ribbon(r) => r == 1 ? c_bull_ribbon : r == 2 ? c_bear_ribbon : c_side_ribbon
+regime_dim(r)    => r == 1 ? c_bull_dim    : r == 2 ? c_bear_dim    : c_side_dim
+regime_name(r)   => r == 1 ? "Bull"        : r == 2 ? "Bear"        : "Sideways"
+regime_abbr(r)   => r == 1 ? "BULL"        : r == 2 ? "BEAR"        : "SIDE"
+
+disp_to_internal(d) => d == 0 ? 1 : d == 1 ? 2 : 0
+
+// ────────────────────────────────────────────────────────────────────────────
+// Per-bar regime label
+// ────────────────────────────────────────────────────────────────────────────
+log_ret = math.log(close / close[lookback_window])
+regime  = na(log_ret) ? int(na) : log_ret > bull_threshold_pct / 100.0 ? 1 : log_ret < -bear_threshold_pct / 100.0 ? 2 : 0
+
+// ────────────────────────────────────────────────────────────────────────────
+// Regime ribbon
+// ────────────────────────────────────────────────────────────────────────────
+ribbon_color_for_bar = regime == 1 ? color.rgb(132, 187, 161, 90) : regime == 2 ? color.rgb(197, 127, 134, 90) : color.rgb(164, 171, 183, 90)
+bgcolor(show_regime_ribbon ? ribbon_color_for_bar : na, title = "Regime ribbon")
+
+// ────────────────────────────────────────────────────────────────────────────
+// Transition counting
+// ────────────────────────────────────────────────────────────────────────────
+var counts = array.new_int(9, 0)
+
+prev_regime = regime[1]
+if barstate.isconfirmed and not na(prev_regime) and not na(regime)
+    idx = prev_regime * 3 + regime
+    array.set(counts, idx, array.get(counts, idx) + 1)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Transition labels — debounced
+// ────────────────────────────────────────────────────────────────────────────
+var int last_lbl_regime = na
+
+held = not na(regime)
+for k = 0 to min_regime_hold - 1
+    held := held and not na(regime[k]) and regime[k] == regime
+
+if barstate.isconfirmed and not na(regime) and held and regime != last_lbl_regime
+    if show_transition_labels and not na(last_lbl_regime)
+        flip_off = min_regime_hold - 1
+        label.new(bar_index - flip_off, high[flip_off], regime_abbr(last_lbl_regime) + "  ->  " + regime_abbr(regime), yloc = yloc.abovebar, style = label.style_label_down, color = regime_solid(regime), textcolor = color.white, size = size.normal)
+    last_lbl_regime := regime
+
+// ────────────────────────────────────────────────────────────────────────────
+// Table objects
+// ────────────────────────────────────────────────────────────────────────────
+var table tbl_banner     = table.new(banner_pos,     1, 1, bgcolor = c_bg,      border_width = 0)
+var table tbl_matrix     = table.new(matrix_pos,     4, 6, bgcolor = c_card_bg, border_width = 2, border_color = c_card_bg, frame_color = c_card_frame, frame_width = 1)
+var table tbl_stationary = table.new(stationary_pos, 3, 4, bgcolor = c_card_bg, border_width = 2, border_color = c_card_bg, frame_color = c_card_frame, frame_width = 1)
+
+// ────────────────────────────────────────────────────────────────────────────
+// 3x3 matrix multiplication — unrolled for portability
+// ────────────────────────────────────────────────────────────────────────────
+matmul_3x3(A, B) =>
+    a00 = array.get(A, 0) ; a01 = array.get(A, 1) ; a02 = array.get(A, 2)
+    a10 = array.get(A, 3) ; a11 = array.get(A, 4) ; a12 = array.get(A, 5)
+    a20 = array.get(A, 6) ; a21 = array.get(A, 7) ; a22 = array.get(A, 8)
+    b00 = array.get(B, 0) ; b01 = array.get(B, 1) ; b02 = array.get(B, 2)
+    b10 = array.get(B, 3) ; b11 = array.get(B, 4) ; b12 = array.get(B, 5)
+    b20 = array.get(B, 6) ; b21 = array.get(B, 7) ; b22 = array.get(B, 8)
+    C = array.new_float(9, 0.0)
+    array.set(C, 0, a00 * b00 + a01 * b10 + a02 * b20)
+    array.set(C, 1, a00 * b01 + a01 * b11 + a02 * b21)
+    array.set(C, 2, a00 * b02 + a01 * b12 + a02 * b22)
+    array.set(C, 3, a10 * b00 + a11 * b10 + a12 * b20)
+    array.set(C, 4, a10 * b01 + a11 * b11 + a12 * b21)
+    array.set(C, 5, a10 * b02 + a11 * b12 + a12 * b22)
+    array.set(C, 6, a20 * b00 + a21 * b10 + a22 * b20)
+    array.set(C, 7, a20 * b01 + a21 * b11 + a22 * b21)
+    array.set(C, 8, a20 * b02 + a21 * b12 + a22 * b22)
+    C
+
+fmt_pct(p) => str.tostring(math.round(p * 100)) + "%"
+
+// ────────────────────────────────────────────────────────────────────────────
+// Last-bar: build P, iterate to stationary, populate tables
+// ────────────────────────────────────────────────────────────────────────────
+if barstate.islast
+
+    P = array.new_float(9, 0.0)
+    for r = 0 to 2
+        row_sum = array.get(counts, r * 3) + array.get(counts, r * 3 + 1) + array.get(counts, r * 3 + 2)
+        for c = 0 to 2
+            cell = row_sum > 0 ? array.get(counts, r * 3 + c) / row_sum : 1.0 / 3.0
+            array.set(P, r * 3 + c, cell)
+
+    M = array.copy(P)
+    for _i = 1 to stationary_power - 1
+        M := matmul_3x3(M, P)
+
+    stat_bull = array.get(M, 0)
+    stat_bear = array.get(M, 1)
+    stat_side = array.get(M, 2)
+
+    if show_regime_banner
+        table.cell(tbl_banner, 0, 0, "Currently: " + regime_name(regime), text_color = c_text_active, bgcolor = regime_solid(regime), text_size = size.large, text_halign = text.align_center, text_valign = text.align_center)
+
+    if show_matrix_table
+        table.cell(tbl_matrix, 0, 0, "MARKOV REGIME", text_color = c_accent,   bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_left)
+        table.cell(tbl_matrix, 1, 0, "",              bgcolor = c_card_bg)
+        table.cell(tbl_matrix, 2, 0, "",              bgcolor = c_card_bg)
+        table.cell(tbl_matrix, 3, 0, "3x3",           text_color = c_foot_txt, bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_right)
+
+        table.cell(tbl_matrix, 0, 1, "",     bgcolor = c_card_bg)
+        table.cell(tbl_matrix, 1, 1, "BULL", text_color = c_hdr_txt, bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_center)
+        table.cell(tbl_matrix, 2, 1, "BEAR", text_color = c_hdr_txt, bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_center)
+        table.cell(tbl_matrix, 3, 1, "SIDE", text_color = c_hdr_txt, bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_center)
+
+        for r = 0 to 2
+            row_name = r == 0 ? "BULL" : r == 1 ? "BEAR" : "SIDE"
+            table.cell(tbl_matrix, 0, r + 2, row_name, text_color = c_hdr_txt, bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_center)
+            for c = 0 to 2
+                ir      = disp_to_internal(r)
+                ic      = disp_to_internal(c)
+                p       = array.get(P, ir * 3 + ic)
+                is_diag = (r == c)
+                cell_bg  = is_diag ? c_diag_bg : c_card_bg
+                cell_txt = is_diag ? c_diag_txt : c_off_txt
+                cell_sz  = is_diag ? val_size   : hdr_size
+                table.cell(tbl_matrix, c + 1, r + 2, fmt_pct(p), text_color = cell_txt, bgcolor = cell_bg, text_size = cell_sz, text_halign = text.align_center, text_valign = text.align_center)
+
+        table.cell(tbl_matrix, 0, 5, "next-state P", text_color = c_foot_txt, bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_left)
+        table.cell(tbl_matrix, 1, 5, "",             bgcolor = c_card_bg)
+        table.cell(tbl_matrix, 2, 5, "",             bgcolor = c_card_bg)
+        table.cell(tbl_matrix, 3, 5, "live",         text_color = c_accent,   bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_right)
+
+    if show_stationary_table
+        table.cell(tbl_stationary, 0, 0, "LONG-RUN MIX", text_color = c_accent,   bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_left)
+        table.cell(tbl_stationary, 1, 0, "",             bgcolor = c_card_bg)
+        table.cell(tbl_stationary, 2, 0, "",             bgcolor = c_card_bg)
+
+        table.cell(tbl_stationary, 0, 1, "BULL", text_color = c_hdr_txt, bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_center)
+        table.cell(tbl_stationary, 1, 1, "BEAR", text_color = c_hdr_txt, bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_center)
+        table.cell(tbl_stationary, 2, 1, "SIDE", text_color = c_hdr_txt, bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_center)
+
+        table.cell(tbl_stationary, 0, 2, fmt_pct(stat_bull), text_color = c_diag_txt, bgcolor = c_diag_bg, text_size = val_size, text_halign = text.align_center, text_valign = text.align_center)
+        table.cell(tbl_stationary, 1, 2, fmt_pct(stat_bear), text_color = c_diag_txt, bgcolor = c_diag_bg, text_size = val_size, text_halign = text.align_center, text_valign = text.align_center)
+        table.cell(tbl_stationary, 2, 2, fmt_pct(stat_side), text_color = c_diag_txt, bgcolor = c_diag_bg, text_size = val_size, text_halign = text.align_center, text_valign = text.align_center)
+
+        table.cell(tbl_stationary, 0, 3, "steady state", text_color = c_foot_txt, bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_left)
+        table.cell(tbl_stationary, 1, 3, "",             bgcolor = c_card_bg)
+        table.cell(tbl_stationary, 2, 3, "live",         text_color = c_accent,   bgcolor = c_card_bg, text_size = hdr_size, text_halign = text.align_right)
+
+// =============================================================================
+// End of file
+// =============================================================================
