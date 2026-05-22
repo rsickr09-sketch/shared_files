@@ -1,21 +1,10 @@
-# CSP Options Scanner — Web App
+These are all a work in progress and will be ever changing.  I will try and add dates with changes made to the files as I can.  TRADE AT YOUR OWN RISK USING THESE TOOLS AS THIS IS NOT FINANCIAL ADVICE!
+
+The pinescripts can be deployed inside of tradingview free version as i do not pay for the paid version myself.
+
+# CSP Options Scanner and DITM call leap scanner — Web App
 
 Run the scanner from any browser, including your phone.
-
----
-
-## Files
-
-```
-csp_webapp/
-├── app.py               ← Flask web server + UI
-├── scanner.py           ← Web-friendly scanner wrapper
-├── options_30delta.py   ← Core scanner (the one you already have)
-├── requirements.txt     ← Python dependencies
-└── README.md
-```
-
----
 
 ## Run Locally (on your computer)
 
